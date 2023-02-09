@@ -1,5 +1,6 @@
 import { GelatoRelay, RelayResponse } from "@gelatonetwork/relay-sdk";
-import { BigNumber, BigNumberish, BytesLike, ethers } from "ethers";
+import Ethers from "@typechain/ethers-v5";
+import { BigNumber, BigNumberish, BytesLike, ethers, Wallet } from "ethers";
 
 import {
   EIP712_SAFE_TX_TYPES,
@@ -36,6 +37,7 @@ export class GaslessWallet {
   #gelatoRelay: GelatoRelay;
   #address: string | undefined;
   #chainId: number | undefined;
+  #wallet: ethers.Wallet | undefined;
   #apiKey: string;
   #isInitiated = false;
 
@@ -52,10 +54,16 @@ export class GaslessWallet {
    * @param {GaslessWalletConfig} config - The configuration for the Gasless Wallet
    *
    */
-  constructor(eoaProvider: EoaProvider, config: GaslessWalletConfig) {
+  constructor(
+    eoaProvider: EoaProvider,
+    config: GaslessWalletConfig,
+    wallet?: ethers.Wallet
+  ) {
     this.#gelatoRelay = new GelatoRelay();
+    this.#wallet = wallet;
     this.#provider = new ethers.providers.Web3Provider(eoaProvider);
     this.#apiKey = config.apiKey;
+    console.log("test-local");
   }
 
   /**
@@ -70,16 +78,17 @@ export class GaslessWallet {
         `Chain Id is not found`
       );
     }
-    const isNetworkSupported = await this.#gelatoRelay.isNetworkSupported(
-      this.#chainId
-    );
-    if (!isNetworkSupported) {
-      throw new GaslessWalletError(
-        ErrorTypes.UnsupportedNetwork,
-        `Chain Id [${this.#chainId}]`
-      );
-    }
-    this.#address = await this._calculateSmartWalletAddress();
+    console.log(1.0);
+    // const isNetworkSupported = await this.#gelatoRelay.isNetworkSupported(
+    //   this.#chainId
+    // );
+    // if (!isNetworkSupported) {
+    //   throw new GaslessWalletError(
+    //     ErrorTypes.UnsupportedNetwork,
+    //     `Chain Id [${this.#chainId}]`
+    //   );
+    // }
+    this.#address = await this._calculateSmartWalletAddress(this.#wallet!);
     if (!this.#address) {
       throw new GaslessWalletError(
         ErrorTypes.WalletNotInitiated,
@@ -138,7 +147,8 @@ export class GaslessWallet {
   public async populateSponsorTransaction(
     to: string,
     data: string,
-    value: BigNumberish = 0
+    value: BigNumberish = 0,
+    wallet: ethers.Wallet
   ): Promise<TransactionData> {
     if (!this.isInitiated() || !this.#address || !this.#chainId) {
       throw new GaslessWalletError(ErrorTypes.WalletNotInitiated);
@@ -147,17 +157,17 @@ export class GaslessWallet {
       return {
         chainId: this.#chainId,
         target: this.#address,
-        data: await this._getExecTransactionData(to, data, value),
+        data: await this._getExecTransactionData(to, data, value, wallet),
       };
     }
     const calls: Multicall2.CallStruct[] = [
       {
         target: GNOSIS_SAFE_PROXY_FACTORY,
-        callData: await this._getCreateProxyData(),
+        callData: await this._getCreateProxyData(wallet),
       },
       {
         target: this.#address,
-        callData: await this._getExecTransactionData(to, data, value),
+        callData: await this._getExecTransactionData(to, data, value, wallet),
       },
     ];
     const multiCallData = this.#multiCallInterface.encodeFunctionData(
@@ -182,13 +192,14 @@ export class GaslessWallet {
   public async sponsorTransaction(
     to: string,
     data: string,
-    value: BigNumberish = 0
+    value: BigNumberish = 0,
+    wallet: ethers.Wallet
   ): Promise<RelayResponse> {
     const {
       chainId,
       data: populatedData,
       target,
-    } = await this.populateSponsorTransaction(to, data, value);
+    } = await this.populateSponsorTransaction(to, data, value, wallet);
     return await this.#gelatoRelay.sponsoredCall(
       {
         chainId,
@@ -202,9 +213,10 @@ export class GaslessWallet {
   private async _getExecTransactionData(
     to: string,
     data: string,
-    value: BigNumberish
+    value: BigNumberish,
+    wallet: ethers.Wallet
   ) {
-    const signature = await this._getSignature(to, data, value);
+    const signature = await this._getSignature(to, data, value, wallet);
     return this.#gnosisSafeInterface.encodeFunctionData("execTransaction", [
       to,
       value,
@@ -219,13 +231,42 @@ export class GaslessWallet {
     ]);
   }
 
-  private async _getSignature(to: string, data: string, value: BigNumberish) {
-    return await this.#provider.send(SIGNED_TYPE_DATA_METHOD, [
-      await this.#provider.getSigner().getAddress(),
-      JSON.stringify(
-        this._getSignTypedData(to, data, value, await this._getNonce())
-      ),
-    ]);
+  private async _getSignature(
+    to: string,
+    data: string,
+    value: BigNumberish,
+    wallet: ethers.Wallet
+  ) {
+    let nonce = await this._getNonce();
+    return wallet._signTypedData(
+      {
+        chainId: this.#chainId,
+        verifyingContract: this.#address!,
+      },
+      EIP712_SAFE_TX_TYPES,
+      {
+        primaryType: "SafeTx",
+        message: {
+          to,
+          value: BigNumber.from(value).toString(),
+          data,
+          operation: OperationType.Call,
+          safeTxGas: BigNumber.from(0).toString(),
+          baseGas: BigNumber.from(0).toString(),
+          gasPrice: BigNumber.from(0).toString(),
+          gasToken: ZERO_ADDRESS,
+          refundReceiver: ZERO_ADDRESS,
+          nonce: BigNumber.from(nonce).toString(),
+        },
+      }
+    );
+
+    // return await this.#provider.send(SIGNED_TYPE_DATA_METHOD, [
+    //   await wallet.address,
+    //   JSON.stringify(
+    //     this._getSignTypedData(to, data, value, await this._getNonce())
+    //   ),
+    // ]);
   }
 
   private _getSignTypedData = (
@@ -267,14 +308,20 @@ export class GaslessWallet {
       : 0;
   };
 
-  private async _getCreateProxyData(): Promise<string> {
+  private async _getCreateProxyData(wallet: ethers.Wallet): Promise<string> {
     return this.#gnosisSafeProxyFactoryInterface.encodeFunctionData(
       "createProxyWithNonce",
-      [GNOSIS_SAFE, await this._getSafeInitializer(), BigNumber.from(SALT)]
+      [
+        GNOSIS_SAFE,
+        await this._getSafeInitializer(wallet),
+        BigNumber.from(SALT),
+      ]
     );
   }
 
-  private async _calculateSmartWalletAddress(): Promise<string> {
+  private async _calculateSmartWalletAddress(
+    wallet: ethers.Wallet
+  ): Promise<string> {
     const deploymentCode = ethers.utils.solidityPack(
       ["bytes", "uint256"],
       [
@@ -290,7 +337,7 @@ export class GaslessWallet {
       [
         ethers.utils.solidityKeccak256(
           ["bytes"],
-          [await this._getSafeInitializer()]
+          [await this._getSafeInitializer(wallet)]
         ),
         SALT,
       ]
@@ -302,8 +349,8 @@ export class GaslessWallet {
     );
   }
 
-  private async _getSafeInitializer(): Promise<string> {
-    const owner = await this.#provider.getSigner().getAddress();
+  private async _getSafeInitializer(wallet: ethers.Wallet): Promise<string> {
+    const owner = await wallet.address;
     return this.#gnosisSafeInterface.encodeFunctionData("setup", [
       [owner],
       BigNumber.from(1),
